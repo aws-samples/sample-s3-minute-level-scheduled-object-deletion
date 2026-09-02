@@ -1,0 +1,48 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sample-s3-scheduled-deletion"
+version = "0.1.0"
+description = "S3 scheduled-deletion CDK application."
+requires-python = ">=3.14"
+dependencies = [
+    "aws-cdk-lib==2.264.0",
+    "cdk-nag==2.38.2",
+    "constructs>=10.5.0,<11.0.0",
+]
+
+[dependency-groups]
+# General developer tooling.
+dev = [
+    "nox==2026.8.10",
+    "pre-commit==4.6.2",
+]
+# Test runner, shared by the stack and Lambda test sessions.
+test = [
+    "pytest==9.1.1",
+]
+# Dependencies the Lambda tests import. These mirror what the AWS-managed
+# Powertools layer provides at runtime; they are not bundled with the
+# functions, which rely on the layer instead.
+lambda-test = [
+    "aws-lambda-powertools==3.25.0",
+    "boto3==1.43.31",
+    "pydantic==2.13.3",
+]
+# Standalone tool groups used by the corresponding nox sessions.
+lint = [
+    "black==26.5.1",
+    "isort==8.0.1",
+]
+security = [
+    "bandit==1.9.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["sample_s3_scheduled_deletion*"]
+exclude = ["sample_s3_scheduled_deletion.lambda*"]

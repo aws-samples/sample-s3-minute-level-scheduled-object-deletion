@@ -1,0 +1,4 @@
+exclude_dirs: [".venv", "venv", ".env", "env", "cdk.out", ".nox", ".pytest_cache", ".kiro"]
+
+assert_used:
+  skips: ["*/test_*.py"]

@@ -1,0 +1,23 @@
+*.swp
+package-lock.json
+__pycache__
+.pytest_cache
+.venv
+*.egg-info
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Python build artifacts
+build/
+dist/
+scripts/
+tmp-outputs/
+.kiro
+
+# nox
+.nox
+.python-version
+
+.DS_Store
