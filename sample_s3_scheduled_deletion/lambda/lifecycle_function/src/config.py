@@ -5,12 +5,10 @@
 
 import json
 import os
-from functools import lru_cache
 
 from src.models import RepositoryConfig, RepositoryEntry
 
 
-@lru_cache(maxsize=1)
 def get_repository_config() -> list[RepositoryEntry]:
     """Parse ``REPOSITORY_CONFIG`` env var and return entries sorted by
     prefix length descending (longest-prefix match first)."""
@@ -52,3 +50,8 @@ def get_data_event_bus_name() -> str:
 def get_dlq_arn() -> str:
     """Return the ``DLQ_ARN`` environment variable."""
     return os.environ["DLQ_ARN"]
+
+
+def get_max_retention_seconds() -> int:
+    """Return the ``MAX_RETENTION_SECONDS`` environment variable."""
+    return int(os.environ["MAX_RETENTION_SECONDS"])

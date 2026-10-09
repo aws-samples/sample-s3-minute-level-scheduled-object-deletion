@@ -5,8 +5,10 @@
 
 import json
 from dataclasses import dataclass
+from enum import Enum
 
 from aws_cdk import Duration, RemovalPolicy, Stack
+from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as targets
 from aws_cdk import aws_iam as iam
@@ -37,6 +39,65 @@ LAMBDA_SRC_ROOT = "sample_s3_scheduled_deletion/lambda"
 # Smallest TTL a retention rule may declare.
 MIN_RETENTION_TTL = Duration.minutes(2)
 
+# Window each failure alarm evaluates.
+ALARM_PERIOD = Duration.minutes(5)
+
+# Longest PROJECT_PREFIX the derived resource names can carry. The binding
+# name is the "<prefix>-s3-object-created-forward" rule; EventBridge rule
+# names are capped at 64 characters.
+MAX_PROJECT_PREFIX_LENGTH = 64 - len("-s3-object-created-forward")
+
+
+def _validate_project_prefix(project_prefix: str) -> None:
+    """Reject a prefix too long for the resource names derived from it."""
+    if len(project_prefix) > MAX_PROJECT_PREFIX_LENGTH:
+        raise ValueError(
+            f"PROJECT_PREFIX must be at most {MAX_PROJECT_PREFIX_LENGTH} "
+            f"characters, got {len(project_prefix)}; longer prefixes push "
+            "derived resource names past their service limits."
+        )
+
+
+class BucketOwnership(Enum):
+    """Ownership type for S3 buckets.
+
+    - ``EXCLUSIVE``: the solution owns the whole S3 bucket: uploads outside the retention
+    prefixes are denied, and an object matching no rule is deleted on arrival.
+    - ``SHARED``: the solution only manages objects in the specified retention prefixes.
+    """
+
+    EXCLUSIVE = "EXCLUSIVE"
+    SHARED = "SHARED"
+
+
+def _validate_retention_bounds(
+    max_retention: Duration,
+    default_lifecycle_expiration: Duration,
+) -> None:
+    """Check the retention ceiling against its floor and the backstop.
+
+    ``max_retention`` is the minute-granularity limit on scheduled deletion;
+    ``default_lifecycle_expiration`` is the coarse S3 Lifecycle backstop. The
+    two are configured independently, so the only relationship required is
+    that the ceiling does not outlive the backstop.
+
+    Raises ``ValueError`` when the ceiling is unusable.
+    """
+    max_ms = max_retention.to_milliseconds()
+
+    if max_ms < MIN_RETENTION_TTL.to_milliseconds():
+        raise ValueError(
+            "max_retention must be at least 2 minutes, to leave room for "
+            "EventBridge Scheduler's 60-second precision."
+        )
+
+    if max_ms > default_lifecycle_expiration.to_milliseconds():
+        raise ValueError(
+            "max_retention must not exceed default_lifecycle_expiration; "
+            "otherwise the Lifecycle rule would delete objects before their "
+            "scheduled deletion time."
+        )
+
 
 @dataclass
 class RetentionRule:
@@ -48,12 +109,17 @@ class RetentionRule:
     @staticmethod
     def _validate_rules(
         rules: list["RetentionRule"],
-        default_lifecycle_expiration: Duration,
+        max_retention: Duration,
     ) -> None:
         """Validate a list of retention rules at synthesis time.
 
         Raises ``ValueError`` when any rule violates the constraints.
         """
+        if not rules:
+            raise ValueError(
+                "A bucket must declare at least one RetentionRule."
+            )
+
         seen_prefixes: set[str] = set()
 
         for rule in rules:
@@ -75,11 +141,10 @@ class RetentionRule:
                     f"'{rule.path_prefix}'"
                 )
 
-            lifecycle_ms = default_lifecycle_expiration.to_milliseconds()
-            if ttl_ms >= lifecycle_ms:
+            if ttl_ms > max_retention.to_milliseconds():
                 raise ValueError(
-                    f"RetentionRule TTL must be less than "
-                    f"default_lifecycle_expiration: '{rule.path_prefix}'"
+                    f"RetentionRule TTL must not exceed max_retention: "
+                    f"'{rule.path_prefix}'"
                 )
 
             if rule.path_prefix in seen_prefixes:
@@ -92,24 +157,42 @@ class RetentionRule:
 
 @dataclass
 class BucketRetentionConfig:
-    """Pairs an S3 bucket with its path-based retention rules."""
+    """Pairs an S3 bucket with its retention rules and ownership mode."""
 
     bucket: s3.IBucket
     retention_rules: list[RetentionRule]
+    ownership: BucketOwnership
+
+    @property
+    def managed_key_prefixes(self) -> list[str]:
+        """Key prefixes the solution may delete from; ``""`` is every key.
+
+        ``SHARED`` stops at the retention prefixes; ``EXCLUSIVE`` needs the
+        whole bucket to delete unmatched objects.
+        """
+        if self.ownership is BucketOwnership.SHARED:
+            return [rule.path_prefix for rule in self.retention_rules]
+        return [""]
+
+    @property
+    def object_arns(self) -> list[str]:
+        """Object ARNs the Lambdas may read and delete."""
+        return [
+            f"{self.bucket.bucket_arn}/{prefix}*"
+            for prefix in self.managed_key_prefixes
+        ]
 
 
 class S3DataDeletion(Construct):
-    """Wires together all scheduled-deletion infrastructure.
+    """Scheduled deletion for the objects of one or more buckets.
 
-    Creates a Lifecycle Lambda (schedules a future deletion when an object
-    is created), a Deletion Lambda (performs scheduled + on-demand
-    deletions), a DLQ for failed async invocations, an EventBridge schedule
-    group, and a rule on the account **default** EventBridge bus that
-    triggers the Lifecycle Lambda on S3 ``Object Created`` events.
+    A rule on the default bus forwards the buckets' S3 events to a custom
+    bus, where a second rule invokes the Lifecycle Lambda. That Lambda
+    schedules each deletion, and the Deletion Lambda carries it out. The
+    construct also creates the DLQ, the event log group and the alarms.
 
-    Each :class:`BucketRetentionConfig` pairs a bucket with its own set of
-    retention rules; the same Lambdas and schedule group are shared across
-    all buckets.  Path prefixes must be unique within each bucket.
+    The caller enables EventBridge notifications and the Lifecycle
+    expiration on each bucket.
     """
 
     def __init__(
@@ -119,6 +202,7 @@ class S3DataDeletion(Construct):
         *,
         bucket_configs: list[BucketRetentionConfig],
         metrics_namespace: str,
+        max_retention: Duration,
         default_lifecycle_expiration: Duration = Duration.days(1),
     ) -> None:
         super().__init__(scope, construct_id)
@@ -126,24 +210,24 @@ class S3DataDeletion(Construct):
         if not bucket_configs:
             raise ValueError("bucket_configs must contain at least one entry.")
 
+        _validate_project_prefix(PROJECT_PREFIX)
+
+        # The ceiling must fit inside the lifecycle expiration.
+        _validate_retention_bounds(max_retention, default_lifecycle_expiration)
+
         # Validate each bucket independently so the same prefix can be reused
         # in different buckets, while duplicates within one bucket are rejected.
         for cfg in bucket_configs:
-            RetentionRule._validate_rules(
-                cfg.retention_rules,
-                default_lifecycle_expiration,
-            )
+            RetentionRule._validate_rules(cfg.retention_rules, max_retention)
 
-        self._bucket_configs = bucket_configs
-
-        # --- S3 server access logging to CloudWatch Logs ---
-        self.enable_access_logging()
-
-        stack = Stack.of(self)
-        project_prefix = PROJECT_PREFIX
+        self._enable_access_logging(bucket_configs)
 
         bucket_arns = [cfg.bucket.bucket_arn for cfg in bucket_configs]
-        object_arns = [f"{arn}/*" for arn in bucket_arns]
+        # Scoped per bucket by ownership mode, so a SHARED bucket's unmanaged
+        # prefixes are out of reach at the IAM layer.
+        object_arns = [
+            arn for cfg in bucket_configs for arn in cfg.object_arns
+        ]
 
         # --- Dedicated EventBridge bus for the Lambdas' own events ---
         # Receives S3 "Object Created" notifications and the application
@@ -267,7 +351,10 @@ class S3DataDeletion(Construct):
                     {
                         "bucket_name": cfg.bucket.bucket_name,
                         "path_prefix": rule.path_prefix,
-                        "ttl_seconds": int(rule.ttl.to_seconds()),
+                        "ttl_seconds": rule.ttl.to_seconds(),
+                        "delete_unmatched": (
+                            cfg.ownership is BucketOwnership.EXCLUSIVE
+                        ),
                     }
                     for cfg in bucket_configs
                     for rule in cfg.retention_rules
@@ -275,11 +362,34 @@ class S3DataDeletion(Construct):
             }
         )
 
+        # --- What the Deletion Lambda may delete: the same prefixes as IAM ---
+        deletion_scope = json.dumps(
+            {
+                "buckets": [
+                    {
+                        "bucket_name": cfg.bucket.bucket_name,
+                        "key_prefixes": cfg.managed_key_prefixes,
+                    }
+                    for cfg in bucket_configs
+                ]
+            }
+        )
+
         # --- Schedule execution role (assumed by EventBridge Scheduler) ---
+        # Only schedules in this stack's group may assume the role.
         self._schedule_execution_role = iam.Role(
             self,
             "ScheduleExecutionRole",
-            assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com"
+            ).with_conditions(
+                {
+                    "StringEquals": {
+                        "aws:SourceAccount": Stack.of(self).account,
+                        "aws:SourceArn": self._schedule_group.attr_arn,
+                    }
+                }
+            ),
         )
 
         # --- Powertools layer (provides aws-lambda-powertools + pydantic) ---
@@ -292,7 +402,7 @@ class S3DataDeletion(Construct):
             ),
         )
 
-        # --- Deletion Lambda (scheduled + on-demand deletions) ---
+        # --- Deletion Lambda (invoked by the deletion schedules) ---
         self._deletion_function = CustomFunction(
             self,
             "DeletionFunction",
@@ -309,6 +419,7 @@ class S3DataDeletion(Construct):
                 "POWERTOOLS_LOG_LEVEL": LOG_LEVEL,
                 "POWERTOOLS_METRICS_NAMESPACE": metrics_namespace,
                 "DATA_EVENT_BUS_NAME": DELETION_EVENT_BUS_NAME,
+                "DELETION_SCOPE": deletion_scope,
             },
         )
 
@@ -329,12 +440,13 @@ class S3DataDeletion(Construct):
                 "POWERTOOLS_LOG_LEVEL": LOG_LEVEL,
                 "POWERTOOLS_METRICS_NAMESPACE": metrics_namespace,
                 "REPOSITORY_CONFIG": repo_config,
-                "PROJECT_PREFIX": project_prefix,
+                "PROJECT_PREFIX": PROJECT_PREFIX,
                 "SCHEDULE_GROUP_NAME": self._schedule_group.name,
                 "SCHEDULE_ROLE_ARN": self._schedule_execution_role.role_arn,
                 "DELETION_FUNCTION_ARN": self._deletion_function.function_arn,
                 "DATA_EVENT_BUS_NAME": DELETION_EVENT_BUS_NAME,
                 "DLQ_ARN": self._dlq.queue_arn,
+                "MAX_RETENTION_SECONDS": str(max_retention.to_seconds()),
             },
         )
 
@@ -344,6 +456,43 @@ class S3DataDeletion(Construct):
                 actions=["lambda:InvokeFunction"],
                 resources=[self._deletion_function.function_arn],
             )
+        )
+        # Deny every invoker except the schedule execution role. Lambda runs
+        # queued async events as itself, without aws:PrincipalArn, so it is
+        # exempt. Never use add_permission or grant_invoke on this function:
+        # an AWS::Lambda::Permission and this policy overwrite each other.
+        deletion_function_arn = self._deletion_function.function_arn
+        _ = _lambda.CfnResourcePolicy(
+            self,
+            "DeletionFunctionResourcePolicy",
+            resource_arn=deletion_function_arn,
+            policy_document={
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "DenyInvokeExceptScheduleExecutionRole",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": [
+                            deletion_function_arn,
+                            f"{deletion_function_arn}:*",
+                        ],
+                        "Condition": {
+                            "ArnNotEquals": {
+                                "aws:PrincipalArn": (
+                                    self._schedule_execution_role.role_arn
+                                )
+                            },
+                            "StringNotEqualsIfExists": {
+                                "aws:PrincipalServiceName": (
+                                    "lambda.amazonaws.com"
+                                )
+                            },
+                        },
+                    }
+                ],
+            },
         )
         # Allow Scheduler to deliver failed invocations to the DLQ
         self._dlq.grant_send_messages(self._schedule_execution_role)
@@ -361,7 +510,7 @@ class S3DataDeletion(Construct):
             iam.PolicyStatement(
                 actions=["scheduler:CreateSchedule"],
                 resources=[
-                    stack.format_arn(
+                    Stack.of(self).format_arn(
                         service="scheduler",
                         resource="schedule",
                         resource_name=f"{self._schedule_group.name}/*",
@@ -381,6 +530,9 @@ class S3DataDeletion(Construct):
                 resources=object_arns,
             )
         )
+        # No list call is made. With s3:ListBucket, HeadObject on a missing
+        # key returns 404 instead of 403, so an object deleted before its
+        # metadata is read is logged as missing, not as a permissions error.
         self._lifecycle_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["s3:ListBucket"],
@@ -400,6 +552,10 @@ class S3DataDeletion(Construct):
                 resources=object_arns,
             )
         )
+        # No list call is made, but the existence check depends on it:
+        # without s3:ListBucket, HeadObject on a missing key returns 403, not
+        # 404, so an already-deleted object fails the invocation instead of
+        # being skipped.
         self._deletion_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["s3:ListBucket"],
@@ -411,18 +567,72 @@ class S3DataDeletion(Construct):
         self._event_bus.grant_put_events_to(self._lifecycle_function)
         self._event_bus.grant_put_events_to(self._deletion_function)
 
-        # --- cdk-nag: object-level and schedule-group wildcards are required
-        # and scoped to the managed buckets / deletion schedule group only. ---
+        # Explicit delivery role for the S3 "Object Created/Deleted" forward
+        # rule (default bus -> custom bus). Declaring it here (rather than
+        # letting CDK auto-generate one) gives a deterministic ARN that the
+        # bus resource policy below can allow-list, and lets us grant it only
+        # events:PutEvents on this one bus.
+        self._forward_rule_role = iam.Role(
+            self,
+            "S3ForwardRuleRole",
+            assumed_by=iam.ServicePrincipal("events.amazonaws.com"),
+        )
+        self._event_bus.grant_put_events_to(self._forward_rule_role)
+
+        # Deny events:PutEvents from every principal except the known
+        # publishers: the two Lambda execution roles and the forward-rule
+        # delivery role. This closes the forged-event injection vector:
+        # without it, any in-account principal holding a broad
+        # events:PutEvents grant could inject a fake "Object Created" event
+        # onto the custom bus and have the Lifecycle Lambda schedule the
+        # deletion of an in-scope object that was never actually (re)uploaded.
+        # Aligns with AWS Security Hub control EventBridge.3 (custom event
+        # buses should have a resource-based policy). The in-code
+        # DELETION_SCOPE check remains as defense in depth.
+        #
+        # NOTE: the forward rule delivers via an IAM role (above), not the
+        # bare events.amazonaws.com service principal, so it must be named
+        # explicitly in the allow-list; a service-name exemption alone would
+        # not cover it and would silently drop every forwarded S3 event.
+        #
+        # AWS::Events::EventBusPolicy requires StatementId and the statement's
+        # Sid to be identical, and both must be alphanumeric.
+        bus_policy_sid = "DenyPutEventsExceptKnownPublishers"
+        _ = events.CfnEventBusPolicy(
+            self,
+            "DeletionEventBusPolicy",
+            event_bus_name=self._event_bus.event_bus_name,
+            statement_id=bus_policy_sid,
+            statement={
+                "Sid": bus_policy_sid,
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "events:PutEvents",
+                "Resource": self._event_bus.event_bus_arn,
+                "Condition": {
+                    "ArnNotEquals": {
+                        "aws:PrincipalArn": [
+                            self._lifecycle_function.role.role_arn,
+                            self._deletion_function.role.role_arn,
+                            self._forward_rule_role.role_arn,
+                        ]
+                    }
+                },
+            },
+        )
+
+        # --- cdk-nag: the wildcards stop at the managed objects and group ---
         NagSuppressions.add_resource_suppressions(
             self._lifecycle_function.role,
             suppressions=[
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "Object-level S3 access (bucket-ARN/*) and one-time "
-                        "schedule creation (schedule-group/*) require a "
-                        "wildcard suffix; both are scoped to the managed "
-                        "bucket(s) and the deletion schedule group."
+                        "Object-level S3 access and one-time schedule "
+                        "creation require a wildcard suffix. Objects are "
+                        "scoped to bucket-ARN/* for a stack-owned bucket and "
+                        "bucket-ARN/<prefix>* for a shared one; schedules to "
+                        "the deletion schedule group."
                     ),
                     "appliesTo": [{"regex": r"/^Resource::.*\*$/g"}],
                 },
@@ -435,9 +645,9 @@ class S3DataDeletion(Construct):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "Object-level S3 access (bucket-ARN/*) requires a "
-                        "wildcard suffix; scoped to the managed bucket(s) "
-                        "only."
+                        "Object-level S3 access requires a wildcard suffix, "
+                        "scoped to bucket-ARN/* for a stack-owned bucket and "
+                        "bucket-ARN/<prefix>* for a shared one."
                     ),
                     "appliesTo": [{"regex": r"/^Resource::.*\*$/g"}],
                 },
@@ -457,7 +667,9 @@ class S3DataDeletion(Construct):
                 detail_type=["Object Created", "Object Deleted"],
                 resources=bucket_arns,
             ),
-            targets=[targets.EventBus(self._event_bus)],
+            targets=[
+                targets.EventBus(self._event_bus, role=self._forward_rule_role)
+            ],
         )
 
         # --- EventBridge: S3 Object Created (custom bus) -> Lifecycle Lambda ---
@@ -482,46 +694,153 @@ class S3DataDeletion(Construct):
             on_failure=destinations.SqsDestination(self._dlq),
         )
 
-        # --- Restrict uploads to allowed prefixes only ---
-        # The resource glob uses a trailing "*" (zero or more characters) so
-        # that zero-byte "folder marker" objects whose key is exactly the
-        # prefix (e.g. "retention-5-mins/") are permitted, letting users
-        # create the empty folder manually.  Such markers have no content
-        # after the prefix and are skipped by the lifecycle Lambda's key
-        # model; the default lifecycle expiration is the backstop for them.
+        # --- Restrict uploads to allowed prefixes (EXCLUSIVE buckets only) ---
+        # A SHARED bucket's other prefixes are not ours to police.
         for cfg in bucket_configs:
-            allowed_arns = [
-                f"{cfg.bucket.bucket_arn}/{rule.path_prefix}*"
-                for rule in cfg.retention_rules
-            ]
-            cfg.bucket.add_to_resource_policy(
-                iam.PolicyStatement(
-                    sid="DenyUploadsOutsideAllowedPrefixes",
-                    effect=iam.Effect.DENY,
-                    principals=[iam.AnyPrincipal()],
-                    actions=["s3:PutObject", "s3:AbortMultipartUpload"],
-                    not_resources=allowed_arns,
-                )
-            )
+            if cfg.ownership is BucketOwnership.EXCLUSIVE:
+                self._deny_uploads_outside_prefixes(cfg)
+
+        # --- Alarms on the failure signals ---
+        self._alarms = self._create_alarms(metrics_namespace)
 
     @property
     def deletion_function(self) -> _lambda.IFunction:
-        """The Lambda that performs scheduled and on-demand deletions."""
+        """The Lambda that deletes objects when their schedules fire."""
         return self._deletion_function
 
-    def enable_access_logging(self) -> None:
-        """Enable S3 server access log delivery to CloudWatch Logs.
+    @property
+    def alarms(self) -> list[cloudwatch.Alarm]:
+        """Alarms on failed deletions; they have no actions until you add some."""
+        return list(self._alarms)
 
-        Uses CloudWatch Logs vended log delivery (``DeliverySource`` →
-        ``DeliveryDestination`` → ``Delivery``) for each managed bucket.
-        This delivers structured access logs to a CloudWatch Logs log group
-        where they can be queried with Logs Insights.
+    def _create_alarms(self, metrics_namespace: str) -> list[cloudwatch.Alarm]:
+        """Alarm on failures that change when, or whether, an object is deleted.
+
+        A failure either exhausts its retries into the DLQ or is handled by a
+        fallback. The DLQ alarm covers the first kind. The application
+        metric alarms cover the fallback that changes the deletion time, and
+        give earlier warning of failed deletions than the DLQ does.
+        """
+        dlq_alarm = self._alarm(
+            "DeletionDlqNotEmptyAlarm",
+            name="deletion-dlq-not-empty",
+            description=(
+                "A Lambda invocation or a schedule delivery failed after its "
+                "retries, so the object is left for the S3 Lifecycle backstop."
+            ),
+            metric=self._dlq.metric_approximate_number_of_messages_visible(
+                period=ALARM_PERIOD,
+                statistic=cloudwatch.Stats.MAXIMUM,
+            ),
+        )
+        # Both application metrics are emitted without dimensions.
+        deletion_error_alarm = self._alarm(
+            "DeletionErrorAlarm",
+            name="deletion-error",
+            description=(
+                "A deletion attempt failed. It is retried, and sent to the "
+                "DLQ if the retries fail too."
+            ),
+            metric=self._failure_metric(metrics_namespace, "DeletionError"),
+        )
+        metadata_alarm = self._alarm(
+            "MetadataLookupFailedAlarm",
+            name="metadata-lookup-failed",
+            description=(
+                "An object's metadata could not be read, so its expireAt was "
+                "ignored and the retention rule's TTL applied instead."
+            ),
+            metric=self._failure_metric(
+                metrics_namespace, "MetadataLookupFailed"
+            ),
+        )
+        return [dlq_alarm, deletion_error_alarm, metadata_alarm]
+
+    @staticmethod
+    def _failure_metric(namespace: str, name: str) -> cloudwatch.Metric:
+        """A dimensionless application failure count."""
+        return cloudwatch.Metric(
+            namespace=namespace,
+            metric_name=name,
+            period=ALARM_PERIOD,
+            statistic=cloudwatch.Stats.SUM,
+        )
+
+    def _alarm(
+        self,
+        construct_id: str,
+        *,
+        name: str,
+        description: str,
+        metric: cloudwatch.IMetric,
+    ) -> cloudwatch.Alarm:
+        """Alarm as soon as *metric* reaches 1 in a period."""
+        return cloudwatch.Alarm(
+            self,
+            construct_id,
+            alarm_name=resource_name(PROJECT_PREFIX, name),
+            alarm_description=description,
+            metric=metric,
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=(
+                cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
+            ),
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+    def _deny_uploads_outside_prefixes(
+        self, cfg: BucketRetentionConfig
+    ) -> None:
+        """Deny uploads outside *cfg*'s retention prefixes.
+
+        The trailing ``*`` matches zero or more characters, so a zero-byte
+        "folder marker" whose key is exactly the prefix is still permitted.
+        ``s3:PutObject`` also authorizes creating, uploading and completing
+        a multipart upload, so the Deny covers those without blocking the
+        abort that cleans up a stranded one.
+
+        Raises ``ValueError`` when CDK cannot attach the statement, as it
+        cannot for a bucket created elsewhere.
+        """
+        allowed_arns = [
+            f"{cfg.bucket.bucket_arn}/{rule.path_prefix}*"
+            for rule in cfg.retention_rules
+        ]
+        result = cfg.bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyUploadsOutsideAllowedPrefixes",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:PutObject"],
+                not_resources=allowed_arns,
+            )
+        )
+        if not result.statement_added:
+            raise ValueError(
+                f"Bucket '{cfg.bucket.node.id}' is declared EXCLUSIVE but the "
+                "prefix Deny could not be attached to it. Declare it SHARED, "
+                "or pass a bucket created in this app."
+            )
+
+    def _enable_access_logging(
+        self, bucket_configs: list[BucketRetentionConfig]
+    ) -> None:
+        """Deliver server access logs of ``EXCLUSIVE`` buckets to CloudWatch.
+
+        ``SHARED`` buckets are skipped: their access logs cover every
+        request, not only the retention prefixes, so that is the owner's call.
 
         See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/sal-cw-enabling.html
         """
-        for idx, cfg in enumerate(self._bucket_configs):
+        owned = [
+            cfg
+            for cfg in bucket_configs
+            if cfg.ownership is BucketOwnership.EXCLUSIVE
+        ]
+        for idx, cfg in enumerate(owned):
             bucket = cfg.bucket
-            suffix = f"-{idx}" if len(self._bucket_configs) > 1 else ""
+            suffix = f"-{idx}" if len(owned) > 1 else ""
 
             # Log group for access logs
             access_log_group = CustomLogGroup(

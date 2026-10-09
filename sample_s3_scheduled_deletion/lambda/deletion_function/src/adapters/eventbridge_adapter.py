@@ -54,7 +54,6 @@ class EventPublisher:
         *,
         bucket: str,
         key: str,
-        source: str,
         version_id: str | None = None,
     ) -> None:
         """Deletion request received."""
@@ -63,7 +62,27 @@ class EventPublisher:
             {
                 "bucket": bucket,
                 "key": key,
-                "source": source,
+                "version_id": version_id,
+            },
+        )
+
+    def deletion_rejected(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        version_id: str | None = None,
+    ) -> None:
+        """Request refused: the object is not one the stack manages."""
+        self._put_event(
+            "DeletionRejected",
+            {
+                "bucket": bucket,
+                "key": key,
+                "reason": (
+                    "Object is outside the buckets and prefixes this stack "
+                    "manages"
+                ),
                 "version_id": version_id,
             },
         )
@@ -73,17 +92,15 @@ class EventPublisher:
         *,
         bucket: str,
         key: str,
-        source: str,
-        prefix: str,
+        prefix: str | None,
         version_id: str | None = None,
     ) -> None:
-        """Object deleted successfully."""
+        """Object deleted successfully; *prefix* is ``None`` at the root."""
         self._put_event(
             "DeletionSucceeded",
             {
                 "bucket": bucket,
                 "key": key,
-                "source": source,
                 "prefix": prefix,
                 "version_id": version_id,
             },
@@ -94,7 +111,6 @@ class EventPublisher:
         *,
         bucket: str,
         key: str,
-        source: str,
         version_id: str | None = None,
     ) -> None:
         """Deletion failed because the object was already gone."""
@@ -103,7 +119,6 @@ class EventPublisher:
             {
                 "bucket": bucket,
                 "key": key,
-                "source": source,
                 "reason": "Object does not exist",
                 "version_id": version_id,
             },
@@ -114,7 +129,6 @@ class EventPublisher:
         *,
         bucket: str,
         key: str,
-        source: str,
         error: str,
         version_id: str | None = None,
     ) -> None:
@@ -124,7 +138,6 @@ class EventPublisher:
             {
                 "bucket": bucket,
                 "key": key,
-                "source": source,
                 "error": error,
                 "version_id": version_id,
             },
