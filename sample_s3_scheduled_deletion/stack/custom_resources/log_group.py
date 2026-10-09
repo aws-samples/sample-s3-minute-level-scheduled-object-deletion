@@ -1,12 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Custom LogGroup construct with secure defaults and Checkov suppression.
-
-Wraps ``aws_cdk.aws_logs.LogGroup`` to enforce six-month retention,
-DESTROY removal policy, and auto-suppress the CKV_AWS_158 finding
-(customer-managed KMS key not required for this sample).
-"""
+"""Log group construct with this sample's defaults."""
 
 from aws_cdk import RemovalPolicy
 from aws_cdk import aws_logs as logs
@@ -14,11 +9,10 @@ from constructs import Construct
 
 
 class CustomLogGroup(logs.LogGroup):
-    """LogGroup with opinionated defaults for this project.
+    """Log group with six-month retention, destroyed with the stack.
 
-    - retention: SIX_MONTHS
-    - removal_policy: DESTROY
-    - Checkov CKV_AWS_158 suppression applied automatically
+    Both defaults can be overridden. Checkov's CKV_AWS_158 (no customer
+    managed key) is suppressed: CloudWatch Logs already encrypts at rest.
     """
 
     def __init__(

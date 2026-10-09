@@ -6,8 +6,8 @@ future deletions via EventBridge Scheduler.
 
 Triggered by S3 ``Object Created`` events that S3 emits to the default
 EventBridge bus and that a forwarding rule routes onto the custom
-deletion bus, where the rule targeting this function lives.  Scheduled
-and on-demand deletions are handled by the separate Deletion Lambda.
+deletion bus, where the rule targeting this function lives.  The
+separate Deletion Lambda deletes the objects.
 """
 
 from aws_lambda_powertools import Logger, Metrics

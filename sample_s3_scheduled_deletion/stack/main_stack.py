@@ -10,6 +10,7 @@ from constructs import Construct
 
 from . import config
 from .constructs.deletion import (
+    BucketOwnership,
     BucketRetentionConfig,
     RetentionRule,
     S3DataDeletion,
@@ -30,11 +31,7 @@ class SampleS3ScheduledDeletionStack(Stack):
         )
 
         # --- Single managed bucket ---
-        bucket = self._create_bucket_with_eventbridge(
-            "DataBucket",
-            lifecycle_expiration,
-            config.BUCKET_COMPONENT,
-        )
+        bucket, ownership = self._resolve_bucket(lifecycle_expiration)
 
         bucket_retention = BucketRetentionConfig(
             bucket=bucket,
@@ -45,6 +42,7 @@ class SampleS3ScheduledDeletionStack(Stack):
                 )
                 for rule in config.RETENTION_RULES
             ],
+            ownership=ownership,
         )
 
         CfnOutput(
@@ -59,19 +57,29 @@ class SampleS3ScheduledDeletionStack(Stack):
             "S3DataDeletion",
             bucket_configs=[bucket_retention],
             metrics_namespace=config.METRICS_NAMESPACE,
+            max_retention=Duration.minutes(config.MAX_RETENTION_MINUTES),
             default_lifecycle_expiration=lifecycle_expiration,
         )
 
-        # Deletion Lambda name, so an on-demand deletion can be triggered by
-        # invoking the function directly.
-        CfnOutput(
-            self,
-            "DeletionFunctionName",
-            value=self.s3_data_deletion.deletion_function.function_name,
-            description=(
-                "Name of the Deletion Lambda (invoke directly for "
-                "on-demand deletions)."
+    def _resolve_bucket(
+        self, expiration: Duration
+    ) -> tuple[s3.IBucket, BucketOwnership]:
+        """Import the bucket named in config, or create one this stack owns."""
+        if config.EXISTING_BUCKET_NAME:
+            return (
+                s3.Bucket.from_bucket_name(
+                    self, "DataBucket", config.EXISTING_BUCKET_NAME
+                ),
+                BucketOwnership.SHARED,
+            )
+
+        return (
+            self._create_bucket_with_eventbridge(
+                "DataBucket",
+                expiration,
+                config.BUCKET_COMPONENT,
             ),
+            BucketOwnership.EXCLUSIVE,
         )
 
     def _create_bucket_with_eventbridge(
@@ -114,6 +122,7 @@ class SampleS3ScheduledDeletionStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             versioned=True,
         )
+        # Backstop for objects the Deletion Lambda never gets to.
         bucket.add_lifecycle_rule(
             expiration=expiration,
             noncurrent_version_expiration=expiration,

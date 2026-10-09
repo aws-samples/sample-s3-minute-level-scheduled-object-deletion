@@ -1,11 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Deletion Lambda — single entry point for all S3 object deletions.
-
-Handles both scheduled (EventBridge Scheduler) and on-demand (API/app)
-deletions through a unified event model.
-"""
+"""Deletion Lambda — deletes S3 objects when their schedules fire."""
 
 from aws_lambda_powertools import Logger, Metrics
 from aws_lambda_powertools.utilities.parser import event_parser
@@ -20,7 +16,7 @@ metrics = Metrics()
 @logger.inject_lambda_context
 @metrics.log_metrics
 @event_parser(model=DeletionRequest)
-def handler(event: DeletionRequest, context: LambdaContext) -> dict | None:
+def handler(event: DeletionRequest, _context: LambdaContext) -> None:
     """Delete an S3 object and emit metrics.
 
     The event is validated by Powertools' parser via ``@event_parser``;
@@ -30,7 +26,7 @@ def handler(event: DeletionRequest, context: LambdaContext) -> dict | None:
         {
             "bucket": "...",
             "key": "...",
-            "source": "scheduled" | "onDemand"
+            "version_id": "..."  (optional)
         }
     """
-    return handle_deletion(event)
+    handle_deletion(event)

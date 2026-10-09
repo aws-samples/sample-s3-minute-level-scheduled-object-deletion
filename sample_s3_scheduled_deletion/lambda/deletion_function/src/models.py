@@ -3,22 +3,39 @@
 
 """Data models for the Deletion Lambda."""
 
-from enum import StrEnum
+from typing import ClassVar
 
-from pydantic import BaseModel, Field
-
-
-class DeletionSource(StrEnum):
-    """Origin of a deletion request."""
-
-    SCHEDULED = "scheduled"
-    ON_DEMAND = "onDemand"
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DeletionRequest(BaseModel):
-    """Unified deletion request for both scheduled and on-demand deletions."""
+    """Deletion request sent by an object's schedule."""
+
+    # Pending schedules still carry the retired "source" key.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
 
     bucket: str = Field(min_length=1)
     key: str = Field(min_length=1)
-    source: DeletionSource
     version_id: str | None = Field(default=None, max_length=1024)
+
+
+class BucketScope(BaseModel):
+    """Keys this function may delete in one bucket."""
+
+    bucket_name: str = Field(min_length=1)
+    # "" covers every key: the stack owns the whole bucket.
+    key_prefixes: list[str] = Field(min_length=1)
+
+
+class DeletionScope(BaseModel):
+    """Parsed ``DELETION_SCOPE`` environment variable."""
+
+    buckets: list[BucketScope]
+
+    def covers(self, *, bucket: str, key: str) -> bool:
+        """Whether *key* in *bucket* is an object the stack manages."""
+        return any(
+            scope.bucket_name == bucket
+            and key.startswith(tuple(scope.key_prefixes))
+            for scope in self.buckets
+        )

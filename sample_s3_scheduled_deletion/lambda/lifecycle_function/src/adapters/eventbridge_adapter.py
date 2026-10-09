@@ -70,12 +70,38 @@ class EventPublisher:
             },
         )
 
+    def object_unmanaged(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        prefix: str | None,
+        version_id: str | None = None,
+    ) -> None:
+        """Object outside the retention prefixes of a shared bucket — kept.
+
+        *prefix* is ``None`` for a key at the bucket root.
+        """
+        self._put_event(
+            "ObjectUnmanaged",
+            {
+                "bucket": bucket,
+                "key": key,
+                "prefix": prefix,
+                "reason": (
+                    "Object key does not match any retention rule and the "
+                    "bucket is shared"
+                ),
+                "version_id": version_id,
+            },
+        )
+
     def object_rejected_deleted(
         self,
         *,
         bucket: str,
         key: str,
-        prefix: str,
+        prefix: str | None,
         version_id: str | None = None,
     ) -> None:
         """Object outside allowed paths — immediately deleted."""
@@ -95,7 +121,7 @@ class EventPublisher:
         *,
         bucket: str,
         key: str,
-        prefix: str,
+        prefix: str | None,
         error: str,
         version_id: str | None = None,
     ) -> None:
@@ -178,6 +204,59 @@ class EventPublisher:
                 "prefix": prefix,
                 "expire_at": expire_at,
                 "default_ttl_seconds": default_ttl_seconds,
+                "version_id": version_id,
+            },
+        )
+
+    def metadata_lookup_failed(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        prefix: str,
+        error: str,
+        default_ttl_seconds: int,
+        version_id: str | None = None,
+    ) -> None:
+        """Object's metadata could not be read; the default TTL applies."""
+        self._put_event(
+            "MetadataLookupFailed",
+            {
+                "bucket": bucket,
+                "key": key,
+                "prefix": prefix,
+                "error": error,
+                "default_ttl_seconds": default_ttl_seconds,
+                "reason": (
+                    "Object metadata could not be read, so any expireAt was "
+                    "ignored"
+                ),
+                "version_id": version_id,
+            },
+        )
+
+    def expire_at_clamped(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        prefix: str,
+        expire_at: str,
+        clamped_schedule_time: str,
+        max_retention_seconds: int,
+        version_id: str | None = None,
+    ) -> None:
+        """Object's expireAt metadata exceeded the retention ceiling."""
+        self._put_event(
+            "ExpireAtClamped",
+            {
+                "bucket": bucket,
+                "key": key,
+                "prefix": prefix,
+                "expire_at": expire_at,
+                "clamped_schedule_time": clamped_schedule_time,
+                "max_retention_seconds": max_retention_seconds,
+                "reason": "Requested expireAt exceeds the retention ceiling",
                 "version_id": version_id,
             },
         )
