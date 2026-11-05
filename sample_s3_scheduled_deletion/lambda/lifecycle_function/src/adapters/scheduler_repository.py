@@ -40,15 +40,15 @@ class SchedulerRepository:
 
         ``CreateSchedule`` called with a ``schedule_name`` that already exists
         raises ``ConflictException``.
-        The pending schedule already deletes the same object version.
+        The pending schedule already targets deletion of the same object version.
 
         On a bucket without versioning, ``version_id`` is absent from the
         name, so overwriting a key while its schedule is pending reuses that
         schedule and the new object inherits the earlier deletion time
         instead of a full TTL.
 
-        Failed invocations are retried by EventBridge Scheduler and, once the
-        retry policy is exhausted, delivered to *dlq_arn* as a dead-letter
+        Failed invocations are retried.
+        If also retries fail, delivered to *dlq_arn* as a dead-letter
         event (invocation metadata + target response).
         """
         try:

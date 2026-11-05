@@ -106,7 +106,7 @@ def test_rule_ttl_may_equal_max_retention():
     _validate([RetentionRule("data/", MAX_RETENTION)])
 
 
-# --- Retention ceiling vs Lifecycle backstop --------------------------------
+# --- Retention ceiling and Lifecycle backstop -------------------------------
 
 
 def _validate_bounds(max_retention, lifecycle=DEFAULT_LIFECYCLE):
@@ -236,7 +236,7 @@ def test_custom_bus_denies_foreign_put_events(template):
     """The custom bus carries a resource policy denying events:PutEvents to
     any principal other than the known publishers -- the two Lambda execution
     roles and the forward-rule delivery role (Security Hub EventBridge.3) --
-    closing the forged-event injection vector."""
+    aimed at closing the forged-event injection vector."""
     policies = template.find_resources(
         "AWS::Events::EventBusPolicy",
         {

@@ -21,8 +21,8 @@ SOURCE = "retention.lifecycle"
 class EventPublisher:
     """Publishes structured events to the data EventBridge bus.
 
-    All events contain only metadata (identifiers, timestamps, operational
-    info) — never object content.
+    Events carry metadata (identifiers, timestamps, operational info), not
+    object content.
     """
 
     def __init__(self, event_bus_name: str) -> None:

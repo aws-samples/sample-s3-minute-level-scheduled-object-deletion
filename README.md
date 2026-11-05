@@ -1,8 +1,8 @@
 # Sample: S3 Scheduled Deletion
 
-Amazon S3 Lifecycle rules expire objects a whole number of days after creation, [rounded up to the next midnight UTC](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html), and the removal that follows is asynchronous, so [an expired object can remain for some time](https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-set-lifecycle-configuration-intro.html#lifecycle-considerations). This sample deletes each object at a set time instead, with minute precision, after a time to live (TTL) configured per key prefix or an `expireAt` timestamp set on the object.
+Amazon S3 Lifecycle rules expire objects a whole number of days after creation, [rounded up to the next midnight UTC](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html), and the removal that follows is asynchronous, so [an expired object can remain for some time](https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-set-lifecycle-configuration-intro.html#lifecycle-considerations). This sample is designed to delete each object at a set time instead, with minute precision, after a time to live (TTL) configured for each key prefix or an `expireAt` timestamp set on the object.
 
-When an object is uploaded, an AWS Lambda function creates a one-time [EventBridge Scheduler schedule](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html) for its deletion time. When the schedule fires, a second Lambda function deletes that object version. An S3 Lifecycle rule stays in place as a backstop for any deletion that does not run.
+When an object is uploaded, an AWS Lambda function creates a one-time [EventBridge Scheduler schedule](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html) for its deletion time. When the schedule fires, a second Lambda function attempts to delete that object version. An S3 Lifecycle rule stays in place, intended as a backstop for a deletion that does not run.
 
 Please note that this sample solution and code are only for testing and non-production purposes.
 
@@ -10,24 +10,24 @@ Please note that this sample solution and code are only for testing and non-prod
 
 ![Solution architecture diagram](assets/arch-diagram.jpg)
 
-1. An object is created in the S3 bucket. A bucket policy denies uploads outside the allowed prefixes, which is the first layer of enforcement. The bucket has Amazon EventBridge notifications enabled, so Amazon S3 emits an `Object Created` event to the account default EventBridge bus.
-2. An EventBridge rule routes S3 `Object Created` and `Object Deleted` events from the default bus to a custom EventBridge bus dedicated to tracking lifecycle and deletion events. Forwarding `Object Deleted` too is what makes the actual removals visible in the consolidated log group (step 8).
+1. An object is created in the S3 bucket. A bucket policy denies uploads outside the allowed prefixes, the first layer of enforcement. The bucket has Amazon EventBridge notifications enabled, so Amazon S3 emits an `Object Created` event to the account default EventBridge bus.
+2. An EventBridge rule routes S3 `Object Created` and `Object Deleted` events from the default bus to a custom bus dedicated to lifecycle and deletion events. `Object Deleted` is forwarded too, so that removals also appear in the consolidated log group (step 8).
 3. Another EventBridge rule routes the event in the custom bus to the Lifecycle Lambda function.
-4. The Lifecycle function matches the object key against the configured TTL rules. If no rule matches, the object is deleted immediately; this is a second layer of enforcement behind the bucket policy of step 1, and it only comes into play if the two ever disagree. Otherwise, the function reads the object's optional `expireAt` user metadata to determine the scheduled time of deletion. If `expireAt` is missing, cannot be read or parsed, or is in the past, `now + TTL` is used instead. Then, it creates a one-time schedule in the EventBridge custom Scheduler group.
-5. When the schedule triggers, EventBridge Scheduler invokes the Deletion Lambda with the bucket, the key and, on a versioned bucket, the version ID to delete. The schedule is [automatically deleted after completion](https://docs.aws.amazon.com/scheduler/latest/UserGuide/managing-schedule-delete.html#managing-schedule-automatic-deletion) to clean up unused resources and avoid saturating the [quota of schedules](https://docs.aws.amazon.com/scheduler/latest/UserGuide/scheduler-quotas.html). A resource-based policy on the Deletion Lambda denies invocation to every principal except the schedule execution role, which only schedules in the stack's schedule group can assume.
-6. The Deletion Lambda function permanently deletes the object version (using `VersionId` on versioned buckets, or a simple key-based delete on non-versioned buckets) and emits metrics and events.
-7. Failed asynchronous invocations of either Lambda function are routed to a shared dead-letter queue (DLQ). A retry mechanism is configured for failed Lambda function invocations.
-8. A rule on the custom bus matches application events and routes them to a single CloudWatch log group for a consolidated recording of all deletion activity.
-9. The bucket also has an S3 Lifecycle expiration as a fallback in case a schedule never fires. The bucket the stack creates is versioned, so the rule expires both current and noncurrent versions; expiring only the current version would add a delete marker and keep the data.
-10. Amazon CloudWatch alarms watch the DLQ and the failure metrics the Lambda functions emit: `DeletionError` from the Deletion function and `MetadataLookupFailed` from the Lifecycle function. An alarm fires as soon as a failure could change when, or whether, an object is deleted; see [Alarms](#alarms).
+4. The Lifecycle function is designed as follows. It matches the object key against the configured TTL rules. If no rule matches, it deletes the object immediately, as a second layer of enforcement behind the bucket policy of step 1. Otherwise, it sets the deletion time from the object's optional `expireAt` user metadata, falling back to `now + TTL` if `expireAt` is missing, unreadable, unparseable or in the past. Then, it creates a one-time schedule in the custom Scheduler group.
+5. When the schedule triggers, EventBridge Scheduler invokes the Deletion Lambda with the bucket, key and, if any, version ID. The schedule is configured to be [automatically deleted after completion](https://docs.aws.amazon.com/scheduler/latest/UserGuide/managing-schedule-delete.html#managing-schedule-automatic-deletion), to help stay within the [quota of schedules](https://docs.aws.amazon.com/scheduler/latest/UserGuide/scheduler-quotas.html). The Deletion Lambda's resource-based policy and a dedicated execution role are configured so that only schedules in the stack's schedule group can invoke it.
+6. The Deletion Lambda function attempts to permanently delete the object version and emits metrics and events.
+7. Failed asynchronous invocations of either Lambda function are retried, then routed to a shared dead-letter queue (DLQ).
+8. A rule on the custom bus routes application events to a single CloudWatch log group, intended to provide a consolidated record of deletion activity.
+9. An S3 Lifecycle expiration is the fallback for a schedule that never fires. It targets both current and noncurrent versions, because expiring only the current version would add a delete marker and keep the data.
+10. Amazon CloudWatch alarms watch the DLQ and the Lambda failure metrics. Their scope is to flag a failure that could change when, or whether, an object is deleted; see [Alarms](#alarms).
 
 ## High level considerations
 
-- The bucket the stack creates is versioned. The Lambda functions also handle a non-versioned bucket, such as an [existing bucket](#using-an-existing-bucket) without versioning. On a versioned bucket, each object version gets its own deletion schedule and is permanently removed, with no delete marker, because the delete call names its `VersionId`. On a non-versioned bucket, the delete call names the key only.
-- The steps above describe the bucket the stack creates and owns. The solution can instead manage only its own prefixes inside a bucket you already have, which changes what it enforces and what it deletes; see [Using an existing bucket](#using-an-existing-bucket).
-- The minimum TTL allowed for an object is two minutes. This is to allow some margin compared to the [60 second precision](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html) of EventBridge Scheduler. The stack rejects shorter TTLs at synthesis time, and the Lifecycle function clamps any earlier `expireAt` to the same two-minute floor.
-- Schedule names are derived deterministically from the bucket, key and, on a versioned bucket, the version ID. `CreateSchedule` is not an upsert, so if EventBridge redelivers an `Object Created` event while the first schedule is still pending, the second attempt raises `ConflictException`. The Lifecycle function treats that as success, logs an Info message and leaves the pending schedule in place, because it already deletes the same object.
-- The Lambda functions run on the `python3.14` managed runtime and get `aws-lambda-powertools` and `pydantic` from the AWS-managed Powertools layer, whose ARN is resolved from SSM Parameter Store at deploy time. Nothing is bundled with the function code, so the local development dependencies exist only to run the tests against the same libraries.
+- The bucket the stack creates is versioned, but the Lambda functions are also designed to handle a non-versioned bucket, such as an [existing bucket](#using-an-existing-bucket). On a versioned bucket, each object version gets its own deletion schedule, and the delete call names its `VersionId` so that the version is permanently removed and not hidden behind a delete marker. On a non-versioned bucket, the delete call names the key only.
+- The steps above describe the bucket the stack creates and owns. The solution can instead be configured to manage only its own prefixes inside a bucket you already have; see [Using an existing bucket](#using-an-existing-bucket).
+- The minimum TTL is two minutes, to allow some margin over the [60 second precision](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html) of EventBridge Scheduler. The stack rejects shorter TTLs at synthesis time, and the Lifecycle function clamps any earlier `expireAt` to the same floor.
+- Schedule names are derived deterministically from the bucket, key and, if any, version ID. `CreateSchedule` is not an upsert, so a redelivered `Object Created` event raises `ConflictException` while the first schedule is pending. The Lifecycle function treats that as success and leaves the pending schedule in place.
+- The Lambda functions run on the `python3.14` managed runtime and get `aws-lambda-powertools` and `pydantic` from the AWS-managed Powertools layer, whose ARN is resolved from SSM Parameter Store at deploy time. Nothing is bundled with the function code; the local development dependencies only serve to run the tests against the same libraries.
 
 ## Repository structure
 
@@ -67,7 +67,7 @@ Install the runtime dependencies into a virtual environment with:
 uv sync
 ```
 
-`uv sync` creates and manages `.venv` automatically. Prefix commands with `uv run` (e.g. `uv run cdk synth`) to execute them inside that environment, or activate it manually with `source .venv/bin/activate` (`.venv\Scripts\activate.bat` on Windows).
+`uv sync` creates and manages `.venv` automatically. Prefix commands with `uv run` (for example, `uv run cdk synth`) to execute them inside that environment, or activate it manually with `source .venv/bin/activate` (`.venv\Scripts\activate.bat` on Windows).
 
 ### Deploy the stack
 
@@ -77,24 +77,22 @@ Verify that you have available credentials with sufficient permissions to deploy
 aws sts get-caller-identity
 ```
 
-Deploy with the AWS CDK, providing target account ID and region for deployment:
+Deploy with the AWS CDK, replacing `111122223333` and `aa-example-1` with your account ID and Region (both required):
 
 ```bash
 uv run cdk synth -c account=111122223333 -c region=aa-example-1
 uv run cdk deploy -c account=111122223333 -c region=aa-example-1
 ```
 
-replacing `111122223333` and `aa-example-1` with the desired Account ID and deployment region, respectively. Account ID and region are required parameters.
-
 ## Testing the solution
 
-After deploying the solution, complete the following steps to test the functionalities of the solution.
+After deployment, complete the following steps to test the solution.
 
 ### Open log trails
 
-Open the log trails to see in real-time the lifecycle events of the object you just uploaded:
+Open the log trails to see in near real-time the lifecycle events of the object you just uploaded:
 1. Log in to the [AWS Management Console](https://console.aws.amazon.com/).
-2. Open the [CloudWatch console](https://console.aws.amazon.com/cloudwatch/home). Make sure to [choose the same AWS Region](https://docs.aws.amazon.com/awsconsolehelpdocs/latest/gsg/select-region-procedure.html) as the Region where you previously deployed the solution.
+2. Open the [CloudWatch console](https://console.aws.amazon.com/cloudwatch/home) in the [Region](https://docs.aws.amazon.com/awsconsolehelpdocs/latest/gsg/select-region-procedure.html) where you deployed the solution.
 3. In the navigation pane, choose Logs / Log Management.
 4. Choose the log group `/aws/events/sample-s3-scheduled-deletion-deletion-events`.
 5. Choose `Start tailing`
@@ -103,18 +101,14 @@ Open the log trails to see in real-time the lifecycle events of the object you j
 
 You can test the solution using [AWS CloudShell](https://aws.amazon.com/cloudshell/), which provides a pre-authenticated browser-based shell environment with the AWS CLI pre-installed.
 
-1. Open the AWS console in a new browser tab or window.
-2. Make sure to choose the same region as the Region where you previously deployed the solution.
-3. Choose the CloudShell icon (terminal icon) in the navigation bar.
-4. Wait for the shell to initialize.
+1. Open the AWS console in a new browser tab, in the Region where you deployed the solution.
+2. Choose the CloudShell icon (terminal icon) in the navigation bar, and wait for the shell to initialize.
 
 ### Test scheduled deletion
 
 Enter the following commands in the CloudShell terminal to upload a test file:
 ```bash
-# The deployed bucket name carries a hash suffix and is published as a stack
-# output (also printed at the end of `cdk deploy` and shown in the
-# CloudFormation console "Outputs" tab). Fetch it into a variable:
+# The bucket name has a hash suffix; read it from the stack output
 BUCKET_NAME=$(aws cloudformation describe-stacks \
   --stack-name SampleS3ScheduledDeletionStack \
   --query "Stacks[0].Outputs[?OutputKey=='DataBucketName'].OutputValue" \
@@ -148,7 +142,7 @@ Following is an example of the expected response:
   }
 ]
 ```
-With the default configuration, the object should be deleted 5 minutes after creation [with 60 second precision](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html).
+With the default configuration, the object is expected to be deleted 5 minutes after creation [with 60 second precision](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html).
 
 Enter the following commands in the CloudShell terminal to verify the deletion schedule has been created:
 ```bash
@@ -179,14 +173,11 @@ aws scheduler list-schedules \
 aws s3api list-object-versions --bucket $BUCKET_NAME \
   --prefix retention-5-mins/test.txt
 ```
-The expected responses should contain empty lists for the schedules and the object versions.
+Both responses should contain empty lists.
 
 ### Test deletion with custom TTL
 
-To test the optional override, set an `expireAt` ISO 8601 timestamp as user
-metadata at upload time.
-
-Enter the following command in the CloudShell terminal to create an object with a custom expiration of at least two minutes in the future:
+Enter the following command in the CloudShell terminal to upload an object with an `expireAt` ISO 8601 timestamp, at least two minutes in the future, as user metadata to test the optional override:
 ```bash
 aws s3 cp test.txt s3://$BUCKET_NAME/retention-5-mins/test.txt \
   --metadata expireAt=YYYY-MM-DDTHH:MM:SSZ
@@ -198,7 +189,7 @@ aws s3 cp test.txt s3://$BUCKET_NAME/retention-5-mins/test.txt \
 - A value greater than `MAX_RETENTION_MINUTES` is capped at it, and emits an `ExpireAtClamped` event and metric.
 - A value in the past, or one that cannot be parsed, is ignored in favour of the rule's default TTL.
 
-A timestamp with a timezone offset is converted to UTC. For example, `2026-09-08T12:00:00+05:00` deletes the object at `2026-09-08T07:00:00Z`.
+A timestamp with a timezone offset is converted to UTC. For example, `2026-09-08T12:00:00+05:00` schedules the deletion of the object for `2026-09-08T07:00:00Z`.
 
 ### Test upload to disallowed prefixes
 
@@ -216,50 +207,46 @@ upload failed: ./test.txt to s3:// [...] An error occurred (AccessDenied) when c
 
 By default, the stack creates and manages its own Amazon S3 bucket. To use a bucket that already exists, set the `EXISTING_BUCKET_NAME` variable in `sample_s3_scheduled_deletion/stack/config.py`.
 
-An existing bucket changes the ownership model from `EXCLUSIVE`, the default, to `SHARED`. The ownership model determines which objects the solution acts on.
-
-The following table compares the two ownership models.
+An existing bucket switches the ownership model from `EXCLUSIVE`, the default, to `SHARED`, which changes the objects the solution acts on. The following table compares the two ownership models.
 
 | Event | `EXCLUSIVE` | `SHARED` |
 | --- | --- | --- |
-| An object is uploaded outside the retention prefixes | A bucket policy denies the upload | The existing bucket policy decides |
-| An object matches no retention rule | The solution deletes the object on arrival | The solution keeps the object and reports `ObjectUnmanaged` |
+| An object is uploaded outside the retention prefixes | Deny the upload with a bucket policy | Defer to the existing bucket policy |
+| An object matches no retention rule | Delete the object on arrival | Keep the object and report `ObjectUnmanaged` |
 | AWS Lambda access to objects | The entire bucket | Only `<prefix>*` for each retention rule |
-| A scheduled deletion names a key outside the retention prefixes, for example after a rule is removed | The Deletion Lambda deletes the object | The Deletion Lambda skips the object and reports `DeletionRejected` |
-| Bucket configuration | The stack applies the bucket policy, the S3 Lifecycle rule, and Amazon EventBridge notifications | The stack changes nothing on the bucket |
+| A scheduled deletion names a key outside the retention prefixes, for example after a rule is removed | Delete the object | Skip the object and report `DeletionRejected` |
+| Bucket configuration | Apply the bucket policy, the S3 Lifecycle rule, and Amazon EventBridge notifications | Leave the bucket configuration unchanged |
 
 Before you deploy, prepare the existing bucket:
 
 - **Required** – Enable EventBridge notifications. Amazon S3 publishes the `Object Created` events that the solution depends on only when notifications are enabled. For more information, see [Enabling Amazon EventBridge](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-event-notifications-eventbridge.html).
-- **Recommended** – Add an S3 Lifecycle expiration that covers the retention prefixes and lasts at least as long as `MAX_RETENTION_MINUTES`. The expiration deletes objects whose scheduled deletion did not run. Add a prefix filter to the rule so that it expires only the objects that the solution manages.
+- **Recommended** – Add an S3 Lifecycle expiration that covers the retention prefixes and lasts at least as long as `MAX_RETENTION_MINUTES`. Add a prefix filter to the rule so that it targets only the objects that the solution manages.
 
 ## Alarms
 
-The stack creates three Amazon CloudWatch alarms. Each one fires when its metric reaches 1 within 5 minutes.
+The stack creates three Amazon CloudWatch alarms, each configured to fire when its metric reaches 1 within 5 minutes. The alarms have no actions, so a firing alarm shows only in the CloudWatch console.
 
 | Alarm | Fires when | What it means |
 | --- | --- | --- |
 | `<PROJECT_PREFIX>-deletion-dlq-not-empty` | The DLQ holds a message | An invocation failed after its retries. The object is left for the S3 Lifecycle backstop. The alarm stays in `ALARM` until the message is removed from the queue. |
-| `<PROJECT_PREFIX>-deletion-error` | The Deletion Lambda emits `DeletionError` | A deletion attempt failed. It is retried, and reaches the DLQ if the retries fail too. |
+| `<PROJECT_PREFIX>-deletion-error` | The Deletion Lambda emits `DeletionError` | A deletion attempt failed. A retry follows, then the DLQ if the retries fail too. |
 | `<PROJECT_PREFIX>-metadata-lookup-failed` | The Lifecycle Lambda emits `MetadataLookupFailed` | An object's metadata could not be read, so its `expireAt` was ignored and the rule's TTL applied. |
-
-The alarms have no actions, so a firing alarm shows only in the CloudWatch console.
 
 ## Troubleshooting
 
-1. **S3 bucket name conflict** — If deployment fails because S3 bucket names must be globally unique, change `PROJECT_PREFIX` in `sample_s3_scheduled_deletion/stack/config.py` to a prefix of your choice, of at most 38 characters. The bucket name is derived deterministically from that prefix, so choose a unique prefix to obtain a unique bucket name.
+1. **S3 bucket name conflict** — The bucket name is derived from `PROJECT_PREFIX` in `sample_s3_scheduled_deletion/stack/config.py`. If the name is already taken, change it to a distinctive prefix of at most 38 characters.
 
-2. **A second deployment in the same account and Region fails with "already exists"** — The stack supports one deployment per account and Region. The bucket the stack creates, the Lambda functions, event bus, EventBridge rules, schedule group, DLQ, alarms, log groups and access-log delivery are named from `PROJECT_PREFIX`, not from the stack name, so a second copy collides with the first even under another stack name. Give each copy its own `PROJECT_PREFIX`.
+2. **A second deployment in the same account and Region fails with "already exists"** — Resource names are derived from `PROJECT_PREFIX`, not from the stack name, so a second copy collides with the first even under another stack name. Give each copy its own `PROJECT_PREFIX`.
 
-3. **Issues with `cdk synth` or `cdk deploy`** — In case of errors synthesizing the stack, check that you have the correct [prerequisites](#prerequisites). Check also that the expected versions of Python and other commands are running in your terminal.
+3. **Issues with `cdk synth` or `cdk deploy`** — Check the [prerequisites](#prerequisites), and that the expected versions of Python and the other tools are the ones running in your terminal.
 
-4. **Objects not uploaded or deletion not scheduled** — Verify the object was uploaded to an allowed path prefix (for instance, `retention-5-mins/`). Also check that the `expireAt` metadata (if used) is in a valid format and set in the future. Check the CloudWatch log group of the lifecycle lambda function and check for logged errors for more information.
+4. **Objects not uploaded or deletion not scheduled** — Verify that the object was uploaded under an allowed prefix (for instance, `retention-5-mins/`) and that any `expireAt` metadata is valid and in the future. Check the Lifecycle Lambda's log group for errors.
 
-5. **Objects created with `expireAt` metadata are not deleted when expected** — Set the `expireAt` timestamp at least two minutes in the future and not greater than `MAX_RETENTION_MINUTES`. A smaller value is raised to the two-minute floor, a greater one is capped at the ceiling, and one in the past or unparseable is ignored in favour of the rule's default TTL. If the Lifecycle function cannot read the object's metadata at all, for example because the request is throttled, it also uses the default TTL and emits a `MetadataLookupFailed` event and metric.
+5. **Objects created with `expireAt` metadata are not deleted when expected** — Check `expireAt` against the bounds in [Test deletion with custom TTL](#test-deletion-with-custom-ttl). If the Lifecycle function cannot read the object's metadata at all, for example because the request is throttled, it falls back to the default TTL and emits a `MetadataLookupFailed` event and metric.
 
-6. **Stack deletion fails due to non-empty bucket** — The bucket has a `DESTROY` removal policy but CDK does not empty buckets automatically. Manually [empty the bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/empty-bucket.html) before retrying the stack deletion.
+6. **Stack deletion fails due to non-empty bucket** — The bucket has a `DESTROY` removal policy, but CDK does not empty buckets automatically. [Empty the bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/empty-bucket.html) and retry.
 
-7. **Nothing happens after uploading to an existing bucket** — Check the prerequisites in [Using an existing bucket](#using-an-existing-bucket), starting with EventBridge notifications. With them disabled the upload succeeds and no event is published, so the Lifecycle Lambda's log group stays empty rather than showing an error.
+7. **Nothing happens after uploading to an existing bucket** — Check that EventBridge notifications are enabled on the bucket (see [Using an existing bucket](#using-an-existing-bucket)). Without them, the upload succeeds but no event is published, so the Lifecycle Lambda logs nothing.
 
 ## Clean up
 
@@ -271,8 +258,8 @@ Remember to [empty the stack's S3 buckets](https://docs.aws.amazon.com/AmazonS3/
 
 ## Development
 
-Install the developer tooling (nox drives the test and quality sessions, and
-each session installs its own dependencies via uv):
+Install the developer tooling (nox runs the test and quality sessions, each
+with its own dependencies installed with uv):
 
 ```bash
 uv sync --group dev
@@ -285,11 +272,11 @@ uv run nox -s tests_stack           # CDK synthesis tests (tests/stack/)
 uv run nox -s run_lambda_fn_tests   # Lambda handler tests (tests/lambda/)
 ```
 
-`tests/stack/` validates the synthesis-time checks (an empty rule list, empty
+`tests/stack/` covers the synthesis-time checks (an empty rule list, empty
 or non-`/`-terminated prefixes, TTLs below the two-minute minimum or above
 `MAX_RETENTION_MINUTES`, duplicate prefixes, and a `PROJECT_PREFIX` longer than
 38 characters) and the resources in the synthesized CloudFormation template.
-`tests/lambda/` validates the Lambda handlers.
+`tests/lambda/` contains unit tests for the Lambda handlers.
 
 You can also run the formatter and security scanners with nox:
 
@@ -300,17 +287,13 @@ uv run nox -s security   # bandit
 
 ### End-to-end test against a live deployment
 
-`tests/stack/` and `tests/lambda/` run entirely offline. To validate a *real*
-deployment, `tests/e2e.py` exercises the solution against live AWS APIs,
-following the same steps as [Testing the solution](#testing-the-solution): it
-uploads an object under a retention prefix, confirms a one-time schedule is
-created, waits for the deletion to fire, and confirms the object and schedule
-are gone. It also checks the `expireAt` override and the disallowed-prefix
-rejection.
+`tests/stack/` and `tests/lambda/` run entirely offline. To check a *real*
+deployment, `tests/e2e.py` automates the steps of
+[Testing the solution](#testing-the-solution) against live AWS APIs.
 
 Deploy the stack first, then run the script with credentials for the target
-account and region. It reads the bucket name from the stack's `DataBucketName`
-output, so you only need to pass the Region (and a profile, if you use one):
+account. It reads the bucket name from the stack output, so you only need to
+pass the Region (and a profile, if you use one):
 
 ```bash
 # with credentials already exported in your environment
@@ -323,8 +306,7 @@ uv run --with boto3 python tests/e2e.py --region aa-example-1 --profile my-profi
 `boto3` is pulled in with `--with` because it is not a dependency of the CDK
 app itself (the Lambda functions get it from the managed runtime).
 
-The scheduled-deletion checks wait for objects to actually be deleted, which
-takes a few minutes. Useful flags:
+Waiting for the deletions typically takes a few minutes. Useful flags:
 
 ```bash
 # schedule-creation only, no waiting for deletion (quick smoke test)
@@ -336,7 +318,7 @@ uv run --with boto3 python tests/e2e.py --region aa-example-1 \
 ```
 
 The script creates every test object under a unique `e2e-<id>/` sub-key and
-removes anything it leaves behind, so it is safe to re-run. Run
+aims to remove anything it leaves behind, so that it can be re-run. Run
 `uv run --with boto3 python tests/e2e.py --help` for the full list of options
 (including `--stack-name`, `--bucket`, `--skip-expire-at`, and
 `--skip-disallowed`). The exit code is `0` only when all selected checks pass.

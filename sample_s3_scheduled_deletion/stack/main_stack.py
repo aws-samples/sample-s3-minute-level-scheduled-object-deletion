@@ -91,14 +91,14 @@ class SampleS3ScheduledDeletionStack(Stack):
         """Create a cdk-nag compliant bucket with EventBridge notifications.
 
         The bucket uses S3-managed encryption, enforces SSL-only access and
-        blocks all public access.  EventBridge notifications are enabled via
-        an L1 override to avoid the CDK BucketNotifications custom-resource
-        Lambda.
+        blocks all public access.  EventBridge notifications are enabled
+        through an L1 override to avoid the CDK BucketNotifications
+        custom-resource Lambda.
 
         If ``component`` is provided, the bucket gets a standardized name
-        ``<prefix>-<component>-<hash>`` (e.g.
+        ``<prefix>-<component>-<hash>`` (for example,
         ``sample-s3-scheduled-deletion-data-3f2a9c1b``); the hash is stable
-        per account/region. Otherwise CDK auto-generates the name.
+        for each account and Region. Otherwise CDK auto-generates the name.
         """
         bucket_name = (
             create_bucket_name(

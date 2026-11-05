@@ -27,13 +27,13 @@ LOG_LEVEL = "INFO"
 # to a central CloudWatch log group.
 DELETION_EVENT_BUS_NAME = resource_name(PROJECT_PREFIX, "deletion-events")
 
-# CloudWatch log group that captures every event published to the custom bus.
+# CloudWatch log group that captures events published to the custom bus.
 DELETION_EVENT_LOG_GROUP_NAME = f"/aws/events/{DELETION_EVENT_BUS_NAME}"
 
 # Duration of the S3 lifecycle expiration on the buckets, applied to both
 # current and noncurrent object versions.
-# Acts as an asynchronous fallback in case of unexpected errors during the
-# scheduled deletion.
+# Intended as an asynchronous fallback in case of unexpected errors during
+# the scheduled deletion.
 DEFAULT_LIFECYCLE_EXPIRATION_DAYS = 1
 
 # Longest retention a single object may be granted, in minutes. This is the
@@ -55,6 +55,9 @@ EXISTING_BUCKET_NAME: str | None = None
 # Retention rules for the managed bucket. Each prefix gets its own TTL.
 # In a stack-created bucket, uploads outside these prefixes are rejected; in
 # an existing bucket, other prefixes are ignored.
+# The prefix name does not have to reflect the TTL, rather, it could be
+# descriptive of the data contained. Here it desscribes the TTL just
+# for demonstrative purposes.
 RETENTION_RULES: list[RetentionRuleConfig] = [
     RetentionRuleConfig(path_prefix="retention-5-mins/", ttl_minutes=5),
     RetentionRuleConfig(path_prefix="retention-2-mins/", ttl_minutes=2),
