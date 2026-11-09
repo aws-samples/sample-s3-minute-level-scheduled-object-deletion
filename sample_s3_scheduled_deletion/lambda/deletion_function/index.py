@@ -19,7 +19,7 @@ metrics = Metrics()
 def handler(event: DeletionRequest, _context: LambdaContext) -> None:
     """Delete an S3 object and emit metrics.
 
-    The event is validated by Powertools' parser via ``@event_parser``;
+    The event is validated by Powertools' parser through ``@event_parser``;
     a malformed payload raises ``ValidationError`` before this function
     runs, routing it to the DLQ. Expected shape::
 

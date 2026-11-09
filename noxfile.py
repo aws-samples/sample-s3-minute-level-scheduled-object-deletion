@@ -33,7 +33,7 @@ def run_lambda_fn_tests(session, function_name: str):
     """Install deps and run pytest for a Lambda function.
 
     Installs only the test runner and the libraries the functions import at
-    runtime (via the Powertools layer). The CDK project itself is not
+    runtime (from the Powertools layer). The CDK project itself is not
     installed; the source is made importable through PYTHONPATH.
     """
     session.run_install(

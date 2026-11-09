@@ -22,9 +22,9 @@ What it checks
    upload outside the configured retention prefixes is denied by the bucket
    policy with AccessDenied.
 
-The script is read-mostly and self-cleaning: every object it creates is under
-a dedicated ``e2e-<uuid>/`` sub-key within a retention prefix, and anything it
-leaves behind is removed in a ``finally`` block.
+The script is read-mostly and meant to clean up after itself: the objects it
+creates are under a dedicated ``e2e-<uuid>/`` sub-key within a retention
+prefix, and a ``finally`` block attempts to remove anything left behind.
 
 Usage
 -----
@@ -67,7 +67,7 @@ except ImportError:  # pragma: no cover - helpful message when boto3 missing
 
 # --- Defaults derived from the sample configuration -------------------------
 # These mirror sample_s3_scheduled_deletion/stack/config.py and constructs.
-# Override via CLI flags if you changed PROJECT_PREFIX or the retention rules.
+# Override with CLI flags if you changed PROJECT_PREFIX or the retention rules.
 DEFAULT_STACK_NAME = "SampleS3ScheduledDeletionStack"
 DEFAULT_PROJECT_PREFIX = "sample-s3-scheduled-deletion"
 DEFAULT_BUCKET_OUTPUT_KEY = "DataBucketName"
@@ -253,7 +253,7 @@ def cleanup_key(ctx: Context, key: str) -> None:
 # --- Test cases -------------------------------------------------------------
 def test_scheduled_deletion(ctx: Context) -> None:
     """Upload -> schedule created -> (optionally) object + schedule removed."""
-    step("Test 1: scheduled deletion via retention rule")
+    step("Test 1: scheduled deletion from a retention rule")
     key = f"{ctx.prefix}e2e-{ctx.run_id}/scheduled.txt"
     info(f"Uploading s3://{ctx.bucket}/{key}")
     before = set(list_schedule_names(ctx))

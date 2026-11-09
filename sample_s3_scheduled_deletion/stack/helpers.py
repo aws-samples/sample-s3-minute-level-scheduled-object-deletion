@@ -46,7 +46,7 @@ def create_bucket_name(
     appended. The hash is the first ``name_hash_length`` hex characters of a
     UUID seeded by the project prefix, component, account and region. The
     deterministic seed keeps the name stable across deploys (so the bucket is
-    not replaced) while differing per environment.
+    not replaced) while differing for each environment.
 
     Example: ``sample-s3-scheduled-deletion-data-3f2a9c1b``
     """
@@ -63,5 +63,5 @@ def create_bucket_name(
 class RetentionRuleConfig:
     """A single path-prefix retention rule."""
 
-    path_prefix: str  # e.g. "retention-5-mins/"
-    ttl_minutes: int  # object is deleted this many minutes after creation
+    path_prefix: str  # for example, "retention-5-mins/"
+    ttl_minutes: int  # deletion is scheduled this many minutes after creation

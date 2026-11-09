@@ -103,8 +103,8 @@ def _validate_retention_bounds(
 class RetentionRule:
     """Configuration for a single path-based retention rule."""
 
-    path_prefix: str  # e.g. "uploads/"
-    ttl: Duration  # e.g. Duration.hours(2)
+    path_prefix: str  # for example, "uploads/"
+    ttl: Duration  # for example, Duration.hours(2)
 
     @staticmethod
     def _validate_rules(
@@ -223,8 +223,8 @@ class S3DataDeletion(Construct):
         self._enable_access_logging(bucket_configs)
 
         bucket_arns = [cfg.bucket.bucket_arn for cfg in bucket_configs]
-        # Scoped per bucket by ownership mode, so a SHARED bucket's unmanaged
-        # prefixes are out of reach at the IAM layer.
+        # Scoped for each bucket by ownership mode, so the IAM grants exclude a
+        # SHARED bucket's unmanaged prefixes.
         object_arns = [
             arn for cfg in bucket_configs for arn in cfg.object_arns
         ]
@@ -238,7 +238,7 @@ class S3DataDeletion(Construct):
             event_bus_name=DELETION_EVENT_BUS_NAME,
         )
 
-        # --- Log group capturing every event from the custom bus ---
+        # --- Log group capturing events from the custom bus ---
         self._event_log_group = CustomLogGroup(
             self,
             "DeletionEventLogGroup",
@@ -246,7 +246,7 @@ class S3DataDeletion(Construct):
             retention=logs.RetentionDays.ONE_MONTH,
         )
 
-        # Route every application event on the custom bus to the log group.
+        # Route application events on the custom bus to the log group.
         # The pattern matches the relevant ``Source`` values including
         # the ones used by Lambda EventPublisher adapters.
         events.CfnRule(
@@ -376,7 +376,7 @@ class S3DataDeletion(Construct):
         )
 
         # --- Schedule execution role (assumed by EventBridge Scheduler) ---
-        # Only schedules in this stack's group may assume the role.
+        # The trust policy is scoped to schedules in this stack's group.
         self._schedule_execution_role = iam.Role(
             self,
             "ScheduleExecutionRole",
@@ -581,16 +581,16 @@ class S3DataDeletion(Construct):
 
         # Deny events:PutEvents from every principal except the known
         # publishers: the two Lambda execution roles and the forward-rule
-        # delivery role. This closes the forged-event injection vector:
-        # without it, any in-account principal holding a broad
-        # events:PutEvents grant could inject a fake "Object Created" event
+        # delivery role. This to address creation of events by untrusted
+        # sources: without it, in-account principals with a broad
+        # events:PutEvents grant could inject fake "Object Created" events
         # onto the custom bus and have the Lifecycle Lambda schedule the
         # deletion of an in-scope object that was never actually (re)uploaded.
         # Aligns with AWS Security Hub control EventBridge.3 (custom event
         # buses should have a resource-based policy). The in-code
         # DELETION_SCOPE check remains as defense in depth.
         #
-        # NOTE: the forward rule delivers via an IAM role (above), not the
+        # NOTE: the forward rule delivers using an IAM role (above), not the
         # bare events.amazonaws.com service principal, so it must be named
         # explicitly in the allow-list; a service-name exemption alone would
         # not cover it and would silently drop every forwarded S3 event.

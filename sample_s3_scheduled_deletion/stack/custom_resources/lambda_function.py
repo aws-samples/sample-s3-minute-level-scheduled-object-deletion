@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Custom Lambda Function construct with a dedicated, least-privilege role.
+"""Custom Lambda Function construct with a dedicated, narrowly scoped role.
 
 Each function has a dedicated IAM role and log group with scoped logging permissions.
 """

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 """Lifecycle Lambda — handles S3 object creation events and schedules
-future deletions via EventBridge Scheduler.
+future deletions with EventBridge Scheduler.
 
 Triggered by S3 ``Object Created`` events that S3 emits to the default
 EventBridge bus and that a forwarding rule routes onto the custom
@@ -30,7 +30,7 @@ def handler(
 ) -> None:
     """Handle S3 ObjectCreated events by scheduling a future deletion.
 
-    The EventBridge envelope is validated by Powertools' parser via the
+    The EventBridge envelope is validated by Powertools' parser through the
     ``@event_parser`` decorator; a malformed event raises ``ValidationError``
     before this function runs, routing it to the DLQ.
     """
